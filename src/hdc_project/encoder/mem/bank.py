@@ -7,7 +7,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from ..utils import ensure_pm1_int8
+from ..utils import ensure_pm1_int8, unbiased_sign_int8
 
 __all__ = [
     "MemBank",
@@ -46,12 +46,12 @@ class MemBank:
         self.M[c, :] += vec.astype(np.int32, copy=False)
         self.n[c] += 1
         if self.thresh:
-            self.H[c, :] = np.where(self.M[c, :] >= 0, 1, -1).astype(np.int8, copy=False)
+            self.H[c, :] = unbiased_sign_int8(self.M[c, :])
 
     def seal(self, c: int) -> None:
         if not (0 <= c < self.B):
             raise IndexError("class index out of range")
-        self.H[c, :] = np.where(self.M[c, :] >= 0, 1, -1).astype(np.int8, copy=False)
+        self.H[c, :] = unbiased_sign_int8(self.M[c, :])
 
     def empirical_mean(self, c: int) -> np.ndarray:
         if self.n[c] == 0:
@@ -76,7 +76,12 @@ def mem_scores(mem: MemBank, R_mem: np.ndarray, use_thresh: bool = True) -> np.n
         raise ValueError("query must have shape (D,)")
     proto = mem.H if use_thresh else np.where(mem.M >= 0, 1, -1).astype(np.int8, copy=False)
     dots = proto.astype(np.int32, copy=False) @ vec.astype(np.int32, copy=False)
-    return (dots / float(mem.D)).astype(np.float64, copy=False)
+    out = (dots / float(mem.D)).astype(np.float64, copy=False)
+    empty = (mem.n == 0)
+    if np.any(empty):
+        out = out.copy()
+        out[empty] = -np.inf
+    return out
 
 
 def mem_scores_chunked(mem: MemBank, R_mem: np.ndarray, chunk: int = 4096, use_thresh: bool = True) -> np.ndarray:

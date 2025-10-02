@@ -22,6 +22,7 @@ from .m6 import (
 )
 from .m7 import M7_SegMgr_new, M7_curKey
 from .utils import unbiased_sign_int8, strict_sign_int8
+from tqdm import tqdm
 
 __all__ = [
     "M8_ENC",
@@ -77,48 +78,7 @@ def M8_ENC(
     pi_pows: list[np.ndarray] | None = None,
     majority_mode: str = "unbiased",
     m5_variant: str = "auto",
-) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, np.ndarray] | Tuple[
-    List[np.ndarray], List[np.ndarray], List[np.ndarray], np.ndarray, np.ndarray
-]:
-    """Encode a token sequence with the ENC brick (modules M5-M7).
-
-    The pipeline slides an ``n``-gram window over ``tokens``. Each window is
-    converted into an HDC vector ``E_t`` (via module M5), reindexed according to
-    the relative offset (module M2), bound with the current segment key (module
-    M3) and accumulated (module M6). The final segment signature ``H`` is
-    obtained by applying either the unbiased or the strict majority policy.
-
-    Args:
-        tokens: Sequence of string tokens describing the segment to encode.
-        pi: Permutation array returned by :func:`~hdc_project.encoder.m2.M2_plan_perm`.
-        n: Order of the ``n``-gram (context window length).
-        LexEN: Lexicon that maps tokens to hypervectors (module M4).
-        D: Dimensionality of the hypervectors.
-        segmgr: Optional segment manager (module M7). When ``None`` a fresh one
-            is instantiated using a seed drawn from ``LexEN``'s RNG.
-        acc_S: Optional accumulator to reuse across calls. When ``None`` a fresh
-            zero accumulator is created.
-        return_bound: If ``True`` the returned tuple includes the bound
-            intermediates representing the bound vectors ``X_t`` hadamard-multiplied with ``K_s`` for inspection or debugging.
-        pi_pows: Optional cache of permutation powers produced by
-            :func:`_ensure_pi_pows`. The cache is expanded automatically when it
-            is not provided.
-        majority_mode: Either ``"unbiased"`` (default) or ``"strict"`` to select
-            the majority policy applied to the accumulator when producing the
-            final signature.
-        m5_variant: Selects which implementation of the M5 encoder is used.
-            ``"auto"`` attempts the unbiased variant first, falling back to the
-            strict or generic implementations when unavailable.
-
-    Returns:
-        A tuple containing the list of raw ``E_t`` vectors, the permutation
-        aligned ``X_t`` vectors, optionally the bound vectors, the final
-        accumulator and the segment signature ``H``.
-
-    Raises:
-        ValueError: If ``majority_mode`` is not ``"unbiased"`` or ``"strict"``.
-    """
-
+):
     tokens_list = list(tokens)
     if segmgr is None:
         seg_seed = int(LexEN.rng.integers(1, 2**31 - 1))
@@ -127,8 +87,9 @@ def M8_ENC(
 
     S = acc_S if acc_S is not None else M6_SegAcc_init(D)
 
+    # OPT: cache minimal pour Δ<n
     if pi_pows is None:
-        pi_pows = _ensure_pi_pows(pi, max(n, len(tokens_list)) + 2)
+        pi_pows = _ensure_pi_pows(pi, n)
 
     rng = getattr(LexEN, "rng", np.random.default_rng())
 
@@ -151,16 +112,25 @@ def M8_ENC(
     X_seq: List[np.ndarray] = []
     Xb_seq: Optional[List[np.ndarray]] = [] if return_bound else None
 
-    for t in range(len(tokens_list)):
-        left = max(0, t - n + 1)
+    # Local bindings pour éviter les recherches d’attribut en boucle
+    _M6_push = M6_SegAcc_push
+    _M3_bind = M3_bind
+    _pi_pows = pi_pows
+    _K = K_s
+
+    L = len(tokens_list)
+    for t in range(L):
+        left = t - n + 1
+        if left < 0:
+            left = 0
         window = tokens_list[left : t + 1]
         E_t = pick_ngram(window)
-        Delta = t - left
-        idx = pi_pows[Delta]
-        X_t = E_t[idx].astype(np.int8, copy=False)
-        S = M6_SegAcc_push(S, X_t, K_s)
-        if return_bound and Xb_seq is not None:
-            Xb_seq.append(M3_bind(X_t, K_s))
+        Delta = t - left  # < n
+        idx = _pi_pows[Delta]
+        X_t = E_t[idx]           # déjà int8
+        S = _M6_push(S, X_t, _K)
+        if Xb_seq is not None:
+            Xb_seq.append(_M3_bind(X_t, _K))
         E_seq.append(E_t)
         X_seq.append(X_t)
 
@@ -171,8 +141,8 @@ def M8_ENC(
     else:
         raise ValueError("majority_mode must be 'unbiased' or 'strict'")
 
-    if return_bound:
-        return E_seq, X_seq, Xb_seq or [], S, H
+    if Xb_seq is not None:
+        return E_seq, X_seq, Xb_seq, S, H
     return E_seq, X_seq, S, H
 
 
@@ -244,12 +214,11 @@ def encode_corpus_ENC(
 
     out: List[Dict[str, Any]] = []
     rng = np.random.default_rng(seg_seed0)
-    for idx, sent in enumerate(sentences, 1):
-        toks = sentence_to_tokens_EN(sent, vocab=set())
+    empty_vocab: set[str] = set()  # OPT: réutilisé
+    for idx, sent in enumerate(tqdm(sentences, total=len(sentences), desc="Processing"), 1):
+        toks = sentence_to_tokens_EN(sent, vocab=empty_vocab)
         seg_seed = int(rng.integers(1, 2**31 - 1))
         out.append(enc_sentence_ENC(toks, n, pi, LexEN, D, seg_seed))
-        if log_every and idx % log_every == 0:
-            pass  # caller configures logging if needed
     return out
 
 
@@ -265,18 +234,23 @@ def intra_inter_ngram_sims(E_seq_list: List[List[np.ndarray]], D: int) -> Tuple[
         consecutive n-grams inside the same sentence and ``s_inter`` is the mean
         absolute similarity between the first n-gram of neighbouring sentences.
     """
-
+    # intra: moyenne des <E_t, E_{t+1}>/D à l’intérieur d’une phrase
     intra_vals: List[float] = []
     for seq in E_seq_list:
-        for a in range(len(seq) - 1):
-            intra_vals.append(float(np.dot(seq[a], seq[a + 1]) / D))
+        if len(seq) >= 2:
+            M = np.stack(seq, axis=0).astype(np.int16, copy=False)
+            dots = (M[:-1] * M[1:]).sum(axis=1, dtype=np.int64) / float(D)
+            intra_vals.append(float(dots.mean()))
     s_intra = float(np.mean(intra_vals)) if intra_vals else 0.0
 
-    inter_vals: List[float] = []
-    for i in range(len(E_seq_list) - 1):
-        if E_seq_list[i] and E_seq_list[i + 1]:
-            inter_vals.append(abs(float(np.dot(E_seq_list[i][0], E_seq_list[i + 1][0]) / D)))
-    s_inter = float(np.mean(inter_vals)) if inter_vals else 0.0
+    # inter: moyenne des |<E^i_0, E^{i+1}_0>|/D entre phrases consécutives
+    heads = [seq[0] for seq in E_seq_list if len(seq) > 0]
+    if len(heads) >= 2:
+        H = np.stack(heads, axis=0).astype(np.int16, copy=False)
+        dots = (H[:-1] * H[1:]).sum(axis=1, dtype=np.int64) / float(D)
+        s_inter = float(np.mean(np.abs(dots)))
+    else:
+        s_inter = 0.0
     return s_intra, s_inter
 
 
@@ -290,9 +264,11 @@ def inter_segment_similarity(H_list: List[np.ndarray]) -> float:
         The arithmetic mean of ``|<H_i, H_{i+1}>| / D`` for consecutive pairs.
         Returns ``0.0`` when fewer than two signatures are provided.
     """
-
-    vals = [abs(float(np.dot(H_list[i], H_list[i + 1]) / H_list[i].size)) for i in range(len(H_list) - 1)]
-    return float(np.mean(vals)) if vals else 0.0
+    if len(H_list) < 2:
+        return 0.0
+    H = np.stack(H_list, axis=0).astype(np.int16, copy=False)
+    dots = (H[:-1] * H[1:]).sum(axis=1, dtype=np.int64) / float(H.shape[1])
+    return float(np.mean(np.abs(dots)))
 
 
 def majority_error_curve(
@@ -324,33 +300,34 @@ def majority_error_curve(
     rng = np.random.default_rng(seed_noise)
     results: Dict[float, List[Tuple[int, float]]] = {eta: [] for eta in eta_list}
 
-    for E_seq in E_seq_list:
+    for E_seq in tqdm(E_seq_list):
         m = len(E_seq)
         if m == 0:
             continue
-        key_seed = int(rng.integers(1, 2**31 - 1))
-        segmgr = M7_SegMgr_new(key_seed, D)
-        K = M7_curKey(segmgr)
 
-        S_clean = M6_SegAcc_init(D)
+        # 1) Pré-compute tous les X_t = Pi^t(E_t)
+        #    NB: on garde int16 pour la somme
+        X_stack = np.empty((m, D), dtype=np.int16)
         for t, E_t in enumerate(E_seq):
-            X_t = M2_perm_pow(E_t, pi, t).astype(np.int8, copy=False)
-            S_clean = M6_SegAcc_push(S_clean, X_t, K)
-        H_clean = M6_SegAcc_sign(S_clean)
+            X_stack[t] = M2_perm_pow(E_t, pi, t).astype(np.int16, copy=False)
 
+        # 2) Somme "clean" + signature
+        S_clean = X_stack.sum(axis=0, dtype=np.int32)           # pas besoin de K pour la décision
+        H_clean = M6_SegAcc_sign(S_clean.astype(np.int16, copy=False))
+
+        # 3) Runs bruités (tous vectorisés)
         for eta in eta_list:
-            S_noisy = M6_SegAcc_init(D)
-            for t, E_t in enumerate(E_seq):
-                X_t = M2_perm_pow(E_t, pi, t).astype(np.int8, copy=False)
-                if eta > 0.0:
-                    mask = rng.random(X_t.shape[0]) < eta
-                    X_t = X_t.copy()
-                    X_t[mask] = -X_t[mask]
-                S_noisy = M6_SegAcc_push(S_noisy, X_t, K)
-            H_noisy = M6_SegAcc_sign(S_noisy)
-            diff = (H_clean.astype(np.int8) * H_noisy.astype(np.int8) == -1).mean()
-            results[eta].append((m, float(diff)))
+            if eta <= 0.0:
+                diff = 0.0
+            else:
+                flips = rng.random(size=X_stack.shape) < float(eta)  # (m,D) bool
+                signs = np.where(flips, -1, 1).astype(np.int16, copy=False)
+                S_noisy = (X_stack * signs).sum(axis=0, dtype=np.int32)
+                H_noisy = M6_SegAcc_sign(S_noisy.astype(np.int16, copy=False))
+                diff = float((H_clean.astype(np.int8) * H_noisy.astype(np.int8) == -1).mean())
+            results[eta].append((m, diff))
 
+    # Agrégation par longueur m
     aggregated: Dict[float, List[Tuple[int, float]]] = {}
     for eta, pairs in results.items():
         by_m: Dict[int, List[float]] = {}
@@ -586,15 +563,12 @@ def content_signature_from_Xseq(X_seq: List[np.ndarray],
     """
     if not X_seq:
         raise ValueError("X_seq vide")
-    D = X_seq[0].shape[0]
-    S = np.zeros((D,), dtype=np.int32)
-    for x in X_seq:
-        S += x.astype(np.int32, copy=False)
+    Xm = np.stack(X_seq, axis=0).astype(np.int16, copy=False)
+    S = Xm.sum(axis=0, dtype=np.int32)
     if majority == "strict":
-        return np.where(S >= 0, 1, -1).astype(np.int8, copy=False)
+        return np.where(S > 0, 1, -1).astype(np.int8, copy=False)
     elif majority == "unbiased":
-        # même seuil, mais vous pouvez ajouter du dithering si besoin
-        return np.where(S >= 0, 1, -1).astype(np.int8, copy=False)
+        return unbiased_sign_int8(S)
     else:
         raise ValueError("majority must be 'strict' or 'unbiased'")
 
@@ -606,20 +580,30 @@ def span_signatures_from_trace(X_seq: List[np.ndarray],
     Balaye X_seq avec une fenêtre glissante pour produire plusieurs signatures de contenu.
     Chaque span donne un hypervecteur de contenu (±1 int8).
     """
-    D = X_seq[0].shape[0] if X_seq else 0
-    if D == 0:
+    if not X_seq:
         return []
+    Xm = np.stack(X_seq, axis=0).astype(np.int16, copy=False)  # (T,D)
+    T, D = Xm.shape
+    # Prefix sum: PS[t] = sum_{i < t} Xm[i]
+    PS = np.zeros((T + 1, D), dtype=np.int32)
+    PS[1:] = np.cumsum(Xm, axis=0, dtype=np.int32)
+
     out: List[np.ndarray] = []
-    T = len(X_seq)
-    if T == 0:
+    if T <= win:
+        S = PS[T] - PS[0]
+        out.append(np.where(S > 0, 1, -1).astype(np.int8, copy=False))
         return out
-    for start in range(0, max(1, T - win + 1), max(1, stride)):
-        stop = min(T, start + win)
-        sign = content_signature_from_Xseq(X_seq[start:stop], majority=majority)
+
+    step = max(1, stride)
+    last_start = T - win
+    for start in range(0, last_start + 1, step):
+        stop = start + win
+        S = PS[stop] - PS[start]
+        if majority == "strict":
+            sign = np.where(S > 0, 1, -1).astype(np.int8, copy=False)
+        else:
+            sign = unbiased_sign_int8(S)
         out.append(sign)
-    # si la phrase est plus courte que win, on a au moins un span (start=0, stop=T)
-    if not out and T > 0:
-        out.append(content_signature_from_Xseq(X_seq, majority=majority))
     return out
 
 def build_mem_pairs_from_encoded(encoded_en: List[Dict[str, Any]],
@@ -637,15 +621,11 @@ def build_mem_pairs_from_encoded(encoded_en: List[Dict[str, Any]],
     pairs: List[Tuple[np.ndarray, np.ndarray]] = []
     N = min(len(encoded_en), len(encoded_fr))
     for i in range(N):
-        X_en = encoded_en[i]["X_seq"]
-        X_fr = encoded_fr[i]["X_seq"]
-        spans_en = span_signatures_from_trace(X_en, win=win, stride=stride, majority=majority)
-        spans_fr = span_signatures_from_trace(X_fr, win=win, stride=stride, majority=majority)
+        spans_en = span_signatures_from_trace(encoded_en[i]["X_seq"], win=win, stride=stride, majority=majority)
+        spans_fr = span_signatures_from_trace(encoded_fr[i]["X_seq"], win=win, stride=stride, majority=majority)
         L = min(len(spans_en), len(spans_fr))
         for t in range(L):
-            ze = spans_en[t].astype(np.int8, copy=False)
-            zf = spans_fr[t].astype(np.int8, copy=False)
-            pairs.append((ze, zf))
+            pairs.append((spans_en[t], spans_fr[t]))
             if max_pairs is not None and len(pairs) >= max_pairs:
                 return pairs
     return pairs

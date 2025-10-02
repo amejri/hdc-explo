@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
-from .binding import to_mem_tranche
+from .binding import to_mem_tranche, bind_tranche_batch
 from .bank import MemBank, mem_scores, mem_argmax, topk_indices
 from .lsh import SignLSH, code_to_bucket
 from .query import build_query_mem
@@ -73,11 +73,11 @@ def make_mem_pipeline(cfg: MemConfig) -> MemComponents:
         A :class:`MemComponents` object bundling the bank, the LSH indexer, the
         MEM binding key and an informational metadata dictionary.
     """
-
     mem = MemBank(B=cfg.B, D=cfg.D, thresh=cfg.thresh)
     lsh = SignLSH.with_k_bits(cfg.D, cfg.k, cfg.seed_lsh)
-    rng = np.random.default_rng(cfg.seed_gmem)
-    gmem = ((rng.integers(0, 2, size=(cfg.D,), dtype=np.int8) << 1) - 1).astype(np.int8, copy=False)
+    # OPT: rand_pm1 → plus direct que integers->shift->cast
+    G = rand_pm1(1, cfg.D, seed=cfg.seed_gmem).reshape(cfg.D).astype(np.int8, copy=False)
+    G.setflags(write=False)
     meta: Dict[str, int | bool] = {
         "B": cfg.B,
         "D": cfg.D,
@@ -86,7 +86,7 @@ def make_mem_pipeline(cfg: MemConfig) -> MemComponents:
         "seed_gmem": cfg.seed_gmem,
         "thresh": cfg.thresh,
     }
-    return MemComponents(mem=mem, lsh=lsh, Gmem=gmem, meta=meta)
+    return MemComponents(mem=mem, lsh=lsh, Gmem=G, meta=meta)
 
 
 def _bucket(lsh: SignLSH, z_mem: np.ndarray, B: int) -> int:
@@ -95,38 +95,66 @@ def _bucket(lsh: SignLSH, z_mem: np.ndarray, B: int) -> int:
     The helper tries the unbiased bucketiser first, then falls back to a simple
     modulo or to the mixed ``code_to_bucket`` reducer.
     """
-
-    try:
+    if hasattr(lsh, "bucket_unbiased"):
         return lsh.bucket_unbiased(z_mem, B)
-    except AttributeError:
+    if hasattr(lsh, "bucket_mod"):
         return lsh.bucket_mod(z_mem, B)
-    except Exception:
-        return code_to_bucket(lsh.code(z_mem), B)
+    # dernier recours: mix & reduce
+    return code_to_bucket(lsh.code(z_mem), B)
 
 
 def train_one_pass_MEM(components: MemComponents,
-                       pairs_en_fr: Iterable[Tuple[np.ndarray, np.ndarray]]) -> None:
+                       pairs_en_fr: Iterable[Tuple[np.ndarray, np.ndarray]],
+                       chunk: int = 4096,) -> None:
     """Perform a single training pass over aligned encoder pairs.
 
     Args:
         components: MEM components returned by :func:`make_mem_pipeline`.
         pairs_en_fr: Iterable of ``(Z_en, Z_fr)`` pairs where both entries have
             shape ``(D,)`` and live in ``{-1, +1}``.
+        chunk: taille de lot pour vectoriser le binding (trade-off RAM/CPU).
 
     Raises:
         ValueError: If the payloads do not have the expected dimensionality.
     """
 
-    mem, lsh, gmem = components.mem, components.lsh, components.Gmem
-    D = gmem.shape[0]
-    for Z_en, Z_fr in pairs_en_fr:
-        ze = np.asarray(Z_en, dtype=np.int8)
-        zf = np.asarray(Z_fr, dtype=np.int8)
-        if ze.shape != (D,) or zf.shape != (D,):
-            raise ValueError("payloads must have shape (D,)")
-        ze_mem = to_mem_tranche(ze, gmem)
-        bucket = _bucket(lsh, ze_mem, mem.B)
-        mem.add(bucket, zf)
+    mem, lsh, G = components.mem, components.lsh, components.Gmem
+    D = int(G.shape[0])
+
+    # Convertit l’itérable en listes plates (si ce n’est pas déjà des arrays)
+    # → cela permet le batching efficace. Si l’itérable est énorme/paresseux,
+    #   remplace par une lecture par blocs côté appelant.
+    if not isinstance(pairs_en_fr, (list, tuple)):
+        pairs_en_fr = list(pairs_en_fr)
+
+    # Prépare des buffers (limite les réallocations)
+    ZEN: list[np.ndarray] = []
+    ZFR: list[np.ndarray] = []
+    ZEN_extend = ZEN.extend
+    ZFR_extend = ZFR.extend
+
+    for ze, zf in pairs_en_fr:
+        ZEN_extend([np.asarray(ze, dtype=np.int8, copy=False)])
+        ZFR_extend([np.asarray(zf, dtype=np.int8, copy=False)])
+
+    N = len(ZEN)
+    if N == 0:
+        return
+
+    # Traitement par blocs
+    for start in range(0, N, chunk):
+        end = min(N, start + chunk)
+        # Empilement → (B, D) int8
+        ZE = np.stack(ZEN[start:end], axis=0).astype(np.int8, copy=False)
+        ZF = np.stack(ZFR[start:end], axis=0).astype(np.int8, copy=False)
+
+        # Binding MEM vectorisé
+        ZE_MEM = bind_tranche_batch(ZE, G)  # (b, D)
+
+        # Boucle mince (bucket + add) — pas de copies inutiles
+        for i in range(ZE_MEM.shape[0]):
+            c = _bucket(lsh, ZE_MEM[i], mem.B)
+            mem.add(c, ZF[i])
 
 
 def infer_map_top1(components: MemComponents,
@@ -144,11 +172,17 @@ def infer_map_top1(components: MemComponents,
         ``(bucket_index, score)`` where ``score`` is the similarity between the
         query and the selected prototype.
     """
+    mem, lsh, G = components.mem, components.lsh, components.Gmem
+    R = np.asarray(R, dtype=np.int8, copy=False)
+    R_mem = to_mem_tranche(R, G)                         # même binding qu’en train
+    c_star = _bucket(lsh, R_mem, mem.B)                  # routage LSH (theory-consistent)
 
-    R_mem = build_query_mem(np.asarray(R, dtype=np.int8), components.Gmem)
-    scores = mem_scores(components.mem, R_mem, use_thresh=use_thresh)
-    c_star = mem_argmax(scores)
-    return c_star, float(scores[c_star])
+    # Score de confiance simple : taille normalisée (ou marge LSH si dispo)
+    # Ici : fraction du bucket vs p99 pour bornage [0,1]
+    n = int(mem.n[c_star])
+    p99 = max(1, int(np.percentile(mem.n, 99)))          # robustifier
+    conf = float(min(1.0, n / p99))
+    return c_star, conf
 
 
 def infer_map_topk(components: MemComponents,
