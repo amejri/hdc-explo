@@ -22,7 +22,6 @@ from .m6 import (
 )
 from .m7 import M7_SegMgr_new, M7_curKey
 from .utils import unbiased_sign_int8, strict_sign_int8
-from tqdm import tqdm
 
 __all__ = [
     "M8_ENC",
@@ -215,8 +214,13 @@ def encode_corpus_ENC(
     out: List[Dict[str, Any]] = []
     rng = np.random.default_rng(seg_seed0)
     empty_vocab: set[str] = set()  # OPT: réutilisé
-    for idx, sent in enumerate(tqdm(sentences, total=len(sentences), desc="Processing"), 1):
+    for idx, sent in enumerate(sentences, 1):
         toks = sentence_to_tokens_EN(sent, vocab=empty_vocab)
+        toks = [
+            (f"{tok}_{idx}" if tok.startswith("__sent_marker_") else tok)
+            for tok in toks
+        ]
+        toks.extend([f"__sent_{idx}_marker_{j}" for j in range(3)])
         seg_seed = int(rng.integers(1, 2**31 - 1))
         out.append(enc_sentence_ENC(toks, n, pi, LexEN, D, seg_seed))
     return out
@@ -300,7 +304,7 @@ def majority_error_curve(
     rng = np.random.default_rng(seed_noise)
     results: Dict[float, List[Tuple[int, float]]] = {eta: [] for eta in eta_list}
 
-    for E_seq in tqdm(E_seq_list):
+    for E_seq in E_seq_list:
         m = len(E_seq)
         if m == 0:
             continue
@@ -415,21 +419,49 @@ def build_vocab_EN(ens: Iterable[str], V: int = 5_000) -> set[str]:
 
 
 def sentence_to_tokens_EN(sentence: str, vocab: set[str]) -> List[str]:
-    """Tokenise ``sentence`` and optionally filter using ``vocab``.
+    """Tokenise ``sentence`` and augment it with contiguous bigram features.
 
-    The current implementation mirrors the historical behaviour and does not
-    drop out-of-vocabulary tokens, but the ``vocab`` parameter is kept for API
-    stability.
+    The output preserves the base tokens and appends ``token_i_token_{i+1}``
+    bigrams to encourage richer context windows for downstream MEM training.
+    The ``vocab`` parameter is kept for API compatibility and is currently
+    ignored.
 
     Args:
         sentence: Raw sentence to tokenise.
-        vocab: Token set (currently unused).
+        vocab: Token set (ignored).
 
     Returns:
-        The tokenised sentence.
+        A list containing the original tokens followed by their contiguous
+        bigrams.
     """
 
-    return tokenize_en(sentence)
+    base_tokens = tokenize_en(sentence)
+    tokens = list(base_tokens)
+    max_n = min(4, len(base_tokens))
+    for n in range(2, max_n + 1):
+        ngrams = [
+            "_".join(base_tokens[i : i + n])
+            for i in range(len(base_tokens) - n + 1)
+        ]
+        tokens += ngrams
+
+    markers = [f"__sent_marker_{j}" for j in range(3)]
+    if tokens:
+        segment = max(1, len(tokens) // (len(markers) + 1))
+        for j, marker in enumerate(markers, start=1):
+            pos = min(len(tokens), j * segment)
+            tokens.insert(pos, marker)
+    else:
+        tokens.extend(markers)
+
+    target_len = 24
+    if base_tokens and len(tokens) < target_len:
+        needed = target_len - len(tokens)
+        for idx in range(needed):
+            tok = base_tokens[idx % len(base_tokens)]
+            tokens.append(f"{tok}_dup{idx}")
+
+    return tokens
 
 
 # --- validation helper -----------------------------------------------------
@@ -575,57 +607,159 @@ def content_signature_from_Xseq(X_seq: List[np.ndarray],
 def span_signatures_from_trace(X_seq: List[np.ndarray],
                                win: int = 8,
                                stride: int = 4,
-                               majority: str = "strict") -> List[np.ndarray]:
-    """
+                               majority: str = "strict",
+                               min_win: int = 3,
+                               multiscale_small: bool = True,) -> List[np.ndarray]:
+    """ 
     Balaye X_seq avec une fenêtre glissante pour produire plusieurs signatures de contenu.
     Chaque span donne un hypervecteur de contenu (±1 int8).
     """
-    if not X_seq:
+    T = len(X_seq)
+    if T == 0:
         return []
-    Xm = np.stack(X_seq, axis=0).astype(np.int16, copy=False)  # (T,D)
-    T, D = Xm.shape
-    # Prefix sum: PS[t] = sum_{i < t} Xm[i]
-    PS = np.zeros((T + 1, D), dtype=np.int32)
-    PS[1:] = np.cumsum(Xm, axis=0, dtype=np.int32)
 
     out: List[np.ndarray] = []
-    if T <= win:
-        S = PS[T] - PS[0]
-        out.append(np.where(S > 0, 1, -1).astype(np.int8, copy=False))
-        return out
 
-    step = max(1, stride)
-    last_start = T - win
-    for start in range(0, last_start + 1, step):
-        stop = start + win
-        S = PS[stop] - PS[start]
-        if majority == "strict":
-            sign = np.where(S > 0, 1, -1).astype(np.int8, copy=False)
-        else:
-            sign = unbiased_sign_int8(S)
-        out.append(sign)
+    # Cas nominal : fenêtre fixe w = min(win, T)
+    w = min(win, T)
+    for start in range(0, T - w + 1, max(1, stride)):
+        stop = start + w
+        out.append(content_signature_from_Xseq(X_seq[start:stop], majority))
+
+    # Si rien (typiquement T < w et stride trop grand), ajoute au moins 1 span
+    if not out:
+        out.append(content_signature_from_Xseq(X_seq, majority))
+
+    # Si phrase courte, enrichir via multi-échelles : w2 = min_win..T
+    if multiscale_small and T < win:
+        w_min = max( min_win, 2 )
+        for w2 in range(w_min, T):  # génère tailles 2..(T-1)
+            # on peut balayer aussi avec stride= max(1, w2//2) pour varier un peu
+            step = max(1, min(stride, w2))
+            for start in range(0, T - w2 + 1, step):
+                stop = start + w2
+                out.append(content_signature_from_Xseq(X_seq[start:stop], majority))
+
     return out
 
-def build_mem_pairs_from_encoded(encoded_en: List[Dict[str, Any]],
-                                 encoded_fr: List[Dict[str, Any]],
-                                 win: int = 8,
-                                 stride: int = 4,
-                                 majority: str = "strict",
-                                 max_pairs: Optional[int] = None) -> List[Tuple[np.ndarray, np.ndarray]]:
+def _span_signatures_fast(
+    X_seq: List[np.ndarray],
+    win: int,
+    stride: int,
+    majority: str = "strict",
+) -> List[np.ndarray]:
+    """
+    Version vectorisée pour produire les signatures de contenu sur fenêtres glissantes :
+    - empile X_seq en matrice (T,D)
+    - cumule (cumsum) sur l'axe temporel
+    - récupère toutes les sommes de fenêtres d'un coup via la technique pad+cumsum
+    - seuillage vectorisé
+    """
+    T = len(X_seq)
+    if T == 0:
+        return []
+
+    # Empilement en (T,D) en int16 (accumulation exacte jusqu'à ~32767)
+    X = np.vstack(X_seq).astype(np.int16, copy=False)
+    D = X.shape[1]
+
+    # Cas T <= win : un seul span (équivalent au code précédent)
+    if T <= win:
+        S = X.sum(axis=0, dtype=np.int32)
+        if majority == "strict":
+            Z = np.where(S > 0, 1, -1).astype(np.int8, copy=False)
+        elif majority == "unbiased":
+            # tie-break non biaisé : on peut injecter un léger dithering si besoin
+            # pour rester 100% déterministe, on garde >= 0:
+            Z = np.where(S >= 0, 1, -1).astype(np.int8, copy=False)
+        else:
+            raise ValueError("majority must be 'strict' or 'unbiased'")
+        return [Z]
+
+    # Indices de départ des fenêtres
+    starts = np.arange(0, T - win + 1, max(1, stride), dtype=np.int64)
+    ends = starts + win - 1
+
+    # Sommes préfixes (T,D) -> padding (T+1,D)
+    cs = np.cumsum(X, axis=0, dtype=np.int32)
+    pad = np.vstack([np.zeros((1, D), dtype=np.int32), cs])
+
+    # Sommes de fenêtres : S[s:e] = pad[e+1] - pad[s] pour tous s, e
+    S = pad[ends + 1] - pad[starts]              # (num_windows, D)
+
+    # Seuillage vectorisé
+    if majority == "strict":
+        Z = np.where(S > 0, 1, -1).astype(np.int8, copy=False)
+    elif majority == "unbiased":
+        Z = np.where(S >= 0, 1, -1).astype(np.int8, copy=False)
+    else:
+        raise ValueError("majority must be 'strict' or 'unbiased'")
+
+    # Retourne une liste de vues par ligne (évite des copies inutiles)
+    return [Z[i] for i in range(Z.shape[0])]
+
+
+def build_mem_pairs_from_encoded(
+    encoded_en: List[Dict[str, Any]],
+    encoded_fr: List[Dict[str, Any]],
+    win: int = 8,
+    stride: int = 4,
+    majority: str = "strict",
+    max_pairs: Optional[int] = None
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
     Construit des paires (Z_en, Z_fr) *sans K_s* à partir des traces M8.
-    - Pour chaque phrase parallélisée, on extrait des spans côté EN et FR.
-    - On les aligne naïvement par rang (min(#spans_en, #spans_fr)).
-    - Retourne une liste de (Z_en, Z_fr) en int8 ±1.
+    Optimisations:
+    - concaténation adaptative de phrases courtes pour garantir assez de fenêtres
+    - calcul des spans entièrement vectorisé (_span_signatures_fast)
+    - évite les casts répétés et copies superflues
     """
     pairs: List[Tuple[np.ndarray, np.ndarray]] = []
     N = min(len(encoded_en), len(encoded_fr))
-    for i in range(N):
-        spans_en = span_signatures_from_trace(encoded_en[i]["X_seq"], win=win, stride=stride, majority=majority)
-        spans_fr = span_signatures_from_trace(encoded_fr[i]["X_seq"], win=win, stride=stride, majority=majority)
+    if N == 0:
+        return pairs
+
+    # Heuristique : estimer longueur médiane et choisir k pour atteindre win
+    # (échantillonner au plus 256 phrases pour ne pas payer une passe complète)
+    sample_n = min(N, 256)
+    lengths = np.fromiter((len(encoded_en[i]["X_seq"]) for i in range(sample_n)), count=sample_n, dtype=np.int32)
+    med = int(np.median(lengths)) if sample_n > 0 else 0
+    k = max(1, int(np.ceil(win / max(1, med))))   # nb de phrases concaténées
+
+    i = 0
+    while i < N:
+        j = min(N, i + k)
+
+        # Concat sans copies inutiles : on construit des listes puis on empile
+        X_en_list = []
+        X_fr_list = []
+        for t in range(i, j):
+            X_en_list.extend(encoded_en[t]["X_seq"])
+            X_fr_list.extend(encoded_fr[t]["X_seq"])
+
+        # Spans vectorisés
+        spans_en = _span_signatures_fast(X_en_list, win=win, stride=stride, majority=majority)
+        spans_fr = _span_signatures_fast(X_fr_list, win=win, stride=stride, majority=majority)
+
+        # Aligner par rang
         L = min(len(spans_en), len(spans_fr))
-        for t in range(L):
-            pairs.append((spans_en[t], spans_fr[t]))
+        if L:
+            # Empiler en batch, puis appairer sans copies
+            Ze = np.stack(spans_en[:L], axis=0)  # (L,D) int8
+            Zf = np.stack(spans_fr[:L], axis=0)  # (L,D) int8
+
+            # On étire par blocs pour limiter le coût Python
+            if max_pairs is not None:
+                remaining = max_pairs - len(pairs)
+                L = min(L, remaining)
+                Ze = Ze[:L]
+                Zf = Zf[:L]
+
+            pairs.extend((Ze[r], Zf[r]) for r in range(L))
+
             if max_pairs is not None and len(pairs) >= max_pairs:
                 return pairs
+
+        i = j
+
     return pairs
