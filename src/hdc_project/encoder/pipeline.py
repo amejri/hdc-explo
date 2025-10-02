@@ -41,6 +41,24 @@ __all__ = [
 
 
 def _ensure_pi_pows(pi: np.ndarray, n: int) -> list[np.ndarray]:
+    """Return cached permutation powers ``[Pi^0, Pi^1, ..., Pi^n]``.
+
+    The helper precomputes forward permutation indices that are reused by the
+    encoder inner loop. The first entry is ``Pi^0`` (identity) and each
+    subsequent entry composes the previous one with ``pi``.
+
+    Args:
+        pi: Permutation array of shape ``(D,)`` containing a bijection over
+            ``0..D-1``.
+        n: Maximum power that must be available in the cache. Values greater
+            than the longest window length guarantee that the cache can be used
+            directly inside the sliding encoder.
+
+    Returns:
+        A list of ``n + 1`` ``numpy.ndarray`` objects describing the reindexing
+        to apply for ``Pi^k``.
+    """
+
     pi_pows = [np.arange(pi.shape[0], dtype=np.int64)]
     for _ in range(n):
         pi_pows.append(pi[pi_pows[-1]])
@@ -62,6 +80,45 @@ def M8_ENC(
 ) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, np.ndarray] | Tuple[
     List[np.ndarray], List[np.ndarray], List[np.ndarray], np.ndarray, np.ndarray
 ]:
+    """Encode a token sequence with the ENC brick (modules M5-M7).
+
+    The pipeline slides an ``n``-gram window over ``tokens``. Each window is
+    converted into an HDC vector ``E_t`` (via module M5), reindexed according to
+    the relative offset (module M2), bound with the current segment key (module
+    M3) and accumulated (module M6). The final segment signature ``H`` is
+    obtained by applying either the unbiased or the strict majority policy.
+
+    Args:
+        tokens: Sequence of string tokens describing the segment to encode.
+        pi: Permutation array returned by :func:`~hdc_project.encoder.m2.M2_plan_perm`.
+        n: Order of the ``n``-gram (context window length).
+        LexEN: Lexicon that maps tokens to hypervectors (module M4).
+        D: Dimensionality of the hypervectors.
+        segmgr: Optional segment manager (module M7). When ``None`` a fresh one
+            is instantiated using a seed drawn from ``LexEN``'s RNG.
+        acc_S: Optional accumulator to reuse across calls. When ``None`` a fresh
+            zero accumulator is created.
+        return_bound: If ``True`` the returned tuple includes the bound
+            intermediates representing the bound vectors ``X_t`` hadamard-multiplied with ``K_s`` for inspection or debugging.
+        pi_pows: Optional cache of permutation powers produced by
+            :func:`_ensure_pi_pows`. The cache is expanded automatically when it
+            is not provided.
+        majority_mode: Either ``"unbiased"`` (default) or ``"strict"`` to select
+            the majority policy applied to the accumulator when producing the
+            final signature.
+        m5_variant: Selects which implementation of the M5 encoder is used.
+            ``"auto"`` attempts the unbiased variant first, falling back to the
+            strict or generic implementations when unavailable.
+
+    Returns:
+        A tuple containing the list of raw ``E_t`` vectors, the permutation
+        aligned ``X_t`` vectors, optionally the bound vectors, the final
+        accumulator and the segment signature ``H``.
+
+    Raises:
+        ValueError: If ``majority_mode`` is not ``"unbiased"`` or ``"strict"``.
+    """
+
     tokens_list = list(tokens)
     if segmgr is None:
         seg_seed = int(LexEN.rng.integers(1, 2**31 - 1))
@@ -127,6 +184,24 @@ def enc_sentence_ENC(
     D: int,
     seg_seed: int,
 ) -> Dict[str, Any]:
+    """Encode a single sentence into the ENC representation.
+
+    This convenience wrapper instantiates a deterministic segment manager using
+    ``seg_seed`` and delegates the encoding to :func:`M8_ENC`.
+
+    Args:
+        sentence_tokens: Token list describing the sentence.
+        n: ``n``-gram order for M5.
+        pi: Permutation used by the encoder.
+        LexEN: Lexicon providing token hypervectors.
+        D: Dimensionality of the hypervectors.
+        seg_seed: Seed used to initialise the segment manager.
+
+    Returns:
+        A dictionary matching the structure produced by :func:`M8_ENC` with
+        additional metadata (sentence length and seed).
+    """
+
     tokens = list(sentence_tokens)
     segmgr = M7_SegMgr_new(seg_seed, D)
     E_seq, X_seq, S, H = M8_ENC(tokens, pi, n, LexEN, D, segmgr=segmgr)
@@ -149,6 +224,24 @@ def encode_corpus_ENC(
     seg_seed0: int = 10_001,
     log_every: int = 1_000,
 ) -> List[Dict[str, Any]]:
+    """Encode a list of sentences with ENC, returning full traces.
+
+    Args:
+        sentences: Raw text sentences that are tokenised using
+            :func:`sentence_to_tokens_EN`.
+        LexEN: Lexicon for token hypervectors.
+        pi: Permutation used for positional binding.
+        D: Dimensionality of the hypervectors.
+        n: ``n``-gram order for ENC.
+        seg_seed0: Master seed used to draw per sentence segment seeds.
+        log_every: Progress logging cadence. The function itself does not log
+            but callers may hook on the iteration index.
+
+    Returns:
+        A list of dictionaries mirroring the structure returned by
+        :func:`enc_sentence_ENC` for each sentence.
+    """
+
     out: List[Dict[str, Any]] = []
     rng = np.random.default_rng(seg_seed0)
     for idx, sent in enumerate(sentences, 1):
@@ -161,6 +254,18 @@ def encode_corpus_ENC(
 
 
 def intra_inter_ngram_sims(E_seq_list: List[List[np.ndarray]], D: int) -> Tuple[float, float]:
+    """Compute intra and inter sentence n-gram similarities.
+
+    Args:
+        E_seq_list: Collection of ``E_t`` sequences (one per sentence).
+        D: Dimensionality used to normalise the dot products.
+
+    Returns:
+        ``(s_intra, s_inter)`` where ``s_intra`` is the mean similarity between
+        consecutive n-grams inside the same sentence and ``s_inter`` is the mean
+        absolute similarity between the first n-gram of neighbouring sentences.
+    """
+
     intra_vals: List[float] = []
     for seq in E_seq_list:
         for a in range(len(seq) - 1):
@@ -176,6 +281,16 @@ def intra_inter_ngram_sims(E_seq_list: List[List[np.ndarray]], D: int) -> Tuple[
 
 
 def inter_segment_similarity(H_list: List[np.ndarray]) -> float:
+    """Compute the mean absolute similarity between consecutive ENC segments.
+
+    Args:
+        H_list: Sequence of segment signatures ``H`` produced by the encoder.
+
+    Returns:
+        The arithmetic mean of ``|<H_i, H_{i+1}>| / D`` for consecutive pairs.
+        Returns ``0.0`` when fewer than two signatures are provided.
+    """
+
     vals = [abs(float(np.dot(H_list[i], H_list[i + 1]) / H_list[i].size)) for i in range(len(H_list) - 1)]
     return float(np.mean(vals)) if vals else 0.0
 
@@ -187,6 +302,25 @@ def majority_error_curve(
     eta_list: Tuple[float, ...] = (0.0, 0.05, 0.10),
     seed_noise: int = 303,
 ) -> Dict[float, List[Tuple[int, float]]]:
+    """Empirically estimate majority vote error rates on real sequences.
+
+    Each sequence ``E_seq`` is replayed twice (clean and noisy) using the same
+    segment key. The noisy run flips individual coordinates with probability
+    ``eta`` before accumulation. The proportion of coordinates that disagree
+    between the clean and noisy signatures is returned for each sequence length.
+
+    Args:
+        E_seq_list: List of n-gram sequences obtained from the encoder.
+        pi: Permutation used for relative reindexing.
+        D: Hypervector dimensionality.
+        eta_list: Noise levels to simulate.
+        seed_noise: RNG seed used to generate the key and the noise masks.
+
+    Returns:
+        A dictionary ``eta -> [(m, error_rate), ...]`` aggregated by sequence
+        length ``m``.
+    """
+
     rng = np.random.default_rng(seed_noise)
     results: Dict[float, List[Tuple[int, float]]] = {eta: [] for eta in eta_list}
 
@@ -234,6 +368,24 @@ def majority_curve_repeated_vector(
     trials_per_m: int = 4_000,
     seed: int = 4242,
 ) -> Dict[float, List[Tuple[int, float]]]:
+    """Simulate majority vote error curves on repeated vectors.
+
+    Instead of replaying the full pipeline this helper draws Bernoulli samples
+    for the majority vote and returns error estimates for the lengths observed
+    in ``E_seq_list``.
+
+    Args:
+        E_seq_list: Source sequences used to collect the empirical length grid.
+        pi: Unused but kept for signature compatibility with callers.
+        D: Unused dimensionality (kept for signature uniformity).
+        eta_list: Noise levels to evaluate.
+        trials_per_m: Number of Monte Carlo trials for each length.
+        seed: RNG seed.
+
+    Returns:
+        Dictionary ``eta -> [(m, error_rate), ...]`` sorted by ``m``.
+    """
+
     m_grid = sorted({len(seq) for seq in E_seq_list if len(seq) > 0})
     if not m_grid:
         return {eta: [] for eta in eta_list}
@@ -255,10 +407,30 @@ def majority_curve_repeated_vector(
 # --- basic NLP helpers -----------------------------------------------------
 
 def tokenize_en(s: str) -> List[str]:
+    """Tokenise English text by lowercasing and dropping empty chunks.
+
+    Args:
+        s: Raw string to tokenise.
+
+    Returns:
+        A list of non empty lowercase tokens separated on whitespace.
+    """
+
     return [w.strip().lower() for w in s.split() if w.strip()]
 
 
 def build_vocab_EN(ens: Iterable[str], V: int = 5_000) -> set[str]:
+    """Extract the ``V`` most frequent tokens from a corpus.
+
+    Args:
+        ens: Iterable of sentences.
+        V: Maximum vocabulary size to keep.
+
+    Returns:
+        A set containing the most frequent tokens according to a simple
+        frequency count.
+    """
+
     counter = Counter()
     for sent in ens:
         counter.update(tokenize_en(sent))
@@ -266,6 +438,20 @@ def build_vocab_EN(ens: Iterable[str], V: int = 5_000) -> set[str]:
 
 
 def sentence_to_tokens_EN(sentence: str, vocab: set[str]) -> List[str]:
+    """Tokenise ``sentence`` and optionally filter using ``vocab``.
+
+    The current implementation mirrors the historical behaviour and does not
+    drop out-of-vocabulary tokens, but the ``vocab`` parameter is kept for API
+    stability.
+
+    Args:
+        sentence: Raw sentence to tokenise.
+        vocab: Token set (currently unused).
+
+    Returns:
+        The tokenised sentence.
+    """
+
     return tokenize_en(sentence)
 
 
@@ -278,6 +464,19 @@ def opus_load_subset(
     N: int = 10_000,
     seed: int = 123,
 ) -> Tuple[List[str], List[str]]:
+    """Download a subset of the OPUS parallel corpus using ``datasets``.
+
+    Args:
+        name: Dataset name on Hugging Face.
+        config: Dataset configuration (language pair).
+        split: Split to download.
+        N: Maximum number of sentence pairs to retain.
+        seed: Shuffle seed applied before slicing ``N`` samples.
+
+    Returns:
+        Two lists containing the English and French sentences.
+    """
+
     from datasets import load_dataset
 
     ds = load_dataset(name, config, split=split)
@@ -294,6 +493,20 @@ def validate_on_opus(
     seed_lex: int = 10_123,
     seed_pi: int = 10_456,
 ) -> Dict[str, Any]:
+    """Run the full ENC validation pipeline on an OPUS subset.
+
+    Args:
+        D: Hypervector dimensionality.
+        n: ``n``-gram order used by the encoder.
+        N: Number of sentence pairs to sample.
+        seed_lex: Seed for the English lexicon.
+        seed_pi: Seed for the permutation plan.
+
+    Returns:
+        A dictionary containing summary statistics (similarities and majority
+        curves) that can be logged or persisted by the caller.
+    """
+
     ens, _ = opus_load_subset("opus_books", "en-fr", "train", N=N, seed=2024)
     Lex = M4_LexEN_new(seed_lex, D, reserve_pool=4_096)
     pi = np.random.default_rng(seed_pi).permutation(D).astype(np.int64)
@@ -323,6 +536,24 @@ def validate_on_opus_enc3(
     seed_lex: int = 10_123,
     seed_pi: int = 10_456,
 ) -> Dict[str, Any]:
+    """Variant of :func:`validate_on_opus` that replaces real replays by simulations.
+
+    The function returns the same summary structure but uses
+    :func:`majority_curve_repeated_vector` to approximate majority vote errors
+    instead of replaying the noisy pipeline.
+
+    Args:
+        D: Hypervector dimensionality.
+        n: ``n``-gram order used by the encoder.
+        N: Number of sentence pairs to sample.
+        seed_lex: Seed for the English lexicon.
+        seed_pi: Seed for the permutation plan.
+
+    Returns:
+        A summary dictionary matching :func:`validate_on_opus` but with
+        simulated majority curves.
+    """
+
     ens, _ = opus_load_subset("opus_books", "en-fr", "train", N=N, seed=2024)
     Lex = M4_LexEN_new(seed_lex, D, reserve_pool=4_096)
     pi = np.random.default_rng(seed_pi).permutation(D).astype(np.int64)
@@ -345,3 +576,76 @@ def validate_on_opus_enc3(
         "inter_segment_abs_mean_sim": s_inter_seg,
         "majority_curves": maj_curves,
     }
+
+
+def content_signature_from_Xseq(X_seq: List[np.ndarray],
+                                majority: str = "strict") -> np.ndarray:
+    """
+    Construit une signature de contenu à partir des X_t (déjà réindexés par Pi^Δ),
+    sans binding par la clé de segment K_s. On somme puis on seuillle.
+    """
+    if not X_seq:
+        raise ValueError("X_seq vide")
+    D = X_seq[0].shape[0]
+    S = np.zeros((D,), dtype=np.int32)
+    for x in X_seq:
+        S += x.astype(np.int32, copy=False)
+    if majority == "strict":
+        return np.where(S >= 0, 1, -1).astype(np.int8, copy=False)
+    elif majority == "unbiased":
+        # même seuil, mais vous pouvez ajouter du dithering si besoin
+        return np.where(S >= 0, 1, -1).astype(np.int8, copy=False)
+    else:
+        raise ValueError("majority must be 'strict' or 'unbiased'")
+
+def span_signatures_from_trace(X_seq: List[np.ndarray],
+                               win: int = 8,
+                               stride: int = 4,
+                               majority: str = "strict") -> List[np.ndarray]:
+    """
+    Balaye X_seq avec une fenêtre glissante pour produire plusieurs signatures de contenu.
+    Chaque span donne un hypervecteur de contenu (±1 int8).
+    """
+    D = X_seq[0].shape[0] if X_seq else 0
+    if D == 0:
+        return []
+    out: List[np.ndarray] = []
+    T = len(X_seq)
+    if T == 0:
+        return out
+    for start in range(0, max(1, T - win + 1), max(1, stride)):
+        stop = min(T, start + win)
+        sign = content_signature_from_Xseq(X_seq[start:stop], majority=majority)
+        out.append(sign)
+    # si la phrase est plus courte que win, on a au moins un span (start=0, stop=T)
+    if not out and T > 0:
+        out.append(content_signature_from_Xseq(X_seq, majority=majority))
+    return out
+
+def build_mem_pairs_from_encoded(encoded_en: List[Dict[str, Any]],
+                                 encoded_fr: List[Dict[str, Any]],
+                                 win: int = 8,
+                                 stride: int = 4,
+                                 majority: str = "strict",
+                                 max_pairs: Optional[int] = None) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Construit des paires (Z_en, Z_fr) *sans K_s* à partir des traces M8.
+    - Pour chaque phrase parallélisée, on extrait des spans côté EN et FR.
+    - On les aligne naïvement par rang (min(#spans_en, #spans_fr)).
+    - Retourne une liste de (Z_en, Z_fr) en int8 ±1.
+    """
+    pairs: List[Tuple[np.ndarray, np.ndarray]] = []
+    N = min(len(encoded_en), len(encoded_fr))
+    for i in range(N):
+        X_en = encoded_en[i]["X_seq"]
+        X_fr = encoded_fr[i]["X_seq"]
+        spans_en = span_signatures_from_trace(X_en, win=win, stride=stride, majority=majority)
+        spans_fr = span_signatures_from_trace(X_fr, win=win, stride=stride, majority=majority)
+        L = min(len(spans_en), len(spans_fr))
+        for t in range(L):
+            ze = spans_en[t].astype(np.int8, copy=False)
+            zf = spans_fr[t].astype(np.int8, copy=False)
+            pairs.append((ze, zf))
+            if max_pairs is not None and len(pairs) >= max_pairs:
+                return pairs
+    return pairs
