@@ -1,6 +1,6 @@
 """HDC project package root."""
 from __future__ import annotations
 
-__all__ = ["encoder"]
+__all__ = ["encoder", "decoder"]
 
-from . import encoder  # noqa: E402  (re-export)
+from . import encoder, decoder  # noqa: E402  (re-export)
