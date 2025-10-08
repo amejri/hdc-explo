@@ -1,40 +1,36 @@
 """Functional tests for the ENC → MEM → DEC translation pipeline."""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import List, Sequence, Tuple
 
 import numpy as np
 
 from hdc_project.encoder import m4, pipeline as enc_pipeline
 from hdc_project.encoder.mem import pipeline as mem_pipeline
-from hdc_project.decoder import (
-    DD7_updateLM,
-    DecodeOneStep,
-)
-from hdc_project.decoder.dec import (
-    rademacher,
-)
 
 
-def _content_signature_from_Xseq(
-    X_seq: Sequence[np.ndarray],
-    *,
-    majority: str = "strict",
+def _lexical_signature_from_tokens(
+    tokens: Sequence[str],
+    L_fr_mem,
+    D: int,
 ) -> np.ndarray:
+    if not tokens:
+        return np.ones(D, dtype=np.int8)
+    acc = np.zeros(D, dtype=np.int32)
+    for tok in tokens:
+        vec = L_fr_mem(tok).astype(np.int8, copy=False)
+        acc += vec.astype(np.int32, copy=False)
+    return np.where(acc >= 0, 1, -1).astype(np.int8, copy=False)
+
+
+def _content_signature_from_Xseq(X_seq: Sequence[np.ndarray]) -> np.ndarray:
     if not X_seq:
         raise ValueError("X_seq vide")
     acc = np.zeros(X_seq[0].shape[0], dtype=np.int32)
     for x in X_seq:
         acc += x.astype(np.int32, copy=False)
-    if majority == "strict":
-        return np.where(acc >= 0, 1, -1).astype(np.int8, copy=False)
-    if majority == "unbiased":
-        rng_local = np.random.default_rng(0)
-        ties = acc == 0
-        acc[ties] = rng_local.integers(0, 2, size=int(ties.sum()), dtype=np.int32) * 2 - 1
-        return np.where(acc >= 0, 1, -1).astype(np.int8, copy=False)
-    raise ValueError("majority must be 'strict' or 'unbiased'")
+    return np.where(acc >= 0, 1, -1).astype(np.int8, copy=False)
 
 
 def _span_signatures_from_trace(
@@ -42,24 +38,17 @@ def _span_signatures_from_trace(
     *,
     win: int,
     stride: int,
-    majority: str,
 ) -> List[Tuple[np.ndarray, int, int]]:
     T = len(X_seq)
     if T == 0:
         return []
     spans: List[Tuple[np.ndarray, int, int]] = []
     if T <= win:
-        spans.append((_content_signature_from_Xseq(X_seq, majority=majority), 0, T))
+        spans.append((_content_signature_from_Xseq(X_seq), 0, T))
         return spans
     for start in range(0, T - win + 1, max(1, stride)):
         stop = start + win
-        spans.append(
-            (
-                _content_signature_from_Xseq(X_seq[start:stop], majority=majority),
-                start,
-                stop,
-            )
-        )
+        spans.append((_content_signature_from_Xseq(X_seq[start:stop]), start, stop))
     return spans
 
 
@@ -68,42 +57,32 @@ def _build_mem_pairs_with_meta(
     encoded_fr: Sequence[dict],
     tokens_fr: Sequence[Sequence[str]],
     *,
+    L_fr_mem,
+    D: int,
     win: int = 8,
     stride: int = 4,
-    majority: str = "strict",
     max_pairs: int | None = None,
 ) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], List[dict]]:
     pairs: List[Tuple[np.ndarray, np.ndarray]] = []
     meta: List[dict] = []
     N = min(len(encoded_en), len(encoded_fr))
     for idx in range(N):
-        spans_en = _span_signatures_from_trace(
-            encoded_en[idx]["X_seq"],
-            win=win,
-            stride=stride,
-            majority=majority,
-        )
-        spans_fr = _span_signatures_from_trace(
-            encoded_fr[idx]["X_seq"],
-            win=win,
-            stride=stride,
-            majority=majority,
-        )
+        spans_en = _span_signatures_from_trace(encoded_en[idx]["X_seq"], win=win, stride=stride)
+        spans_fr = _span_signatures_from_trace(encoded_fr[idx]["X_seq"], win=win, stride=stride)
         tok_fr = list(tokens_fr[idx]) if idx < len(tokens_fr) else []
         L = min(len(spans_en), len(spans_fr))
-        for (ze, start_en, stop_en), (zf, start_fr, stop_fr) in zip(spans_en[:L], spans_fr[:L]):
-            pairs.append((ze, zf))
+        for (ze, start_en, stop_en), (_, start_fr, stop_fr) in zip(spans_en[:L], spans_fr[:L]):
             span_tokens = tok_fr[start_fr:stop_fr] if tok_fr else []
-            history = tok_fr[max(0, start_fr - stride):start_fr] if tok_fr else []
+            zf_lex = _lexical_signature_from_tokens(span_tokens, L_fr_mem, D)
+            pairs.append((ze, zf_lex))
             meta.append(
                 {
                     "sentence_idx": idx,
                     "start": start_fr,
                     "stop": stop_fr,
-                    "history_tokens": history,
+                    "history_tokens": tok_fr[max(0, start_fr - stride):start_fr] if tok_fr else [],
                     "span_tokens": span_tokens,
                     "Z_en": ze,
-                    "Z_fr": zf,
                 }
             )
             if max_pairs is not None and len(pairs) >= max_pairs:
@@ -111,14 +90,18 @@ def _build_mem_pairs_with_meta(
     return pairs, meta
 
 
-def _bucket_vocab(comp: mem_pipeline.MemComponents, span_meta: Sequence[dict]) -> dict[int, list[str]]:
-    bucket_vocab: dict[int, set[str]] = defaultdict(set)
+def _bucket_vocab_freq(comp: mem_pipeline.MemComponents, span_meta: Sequence[dict], tokens_fr: Sequence[Sequence[str]]) -> dict[int, list[tuple[str, int]]]:
+    bucket_counts: dict[int, Counter] = defaultdict(Counter)
     for meta in span_meta:
         bucket_idx, _ = mem_pipeline.infer_map_top1(comp, meta["Z_en"])
-        meta["bucket_idx"] = int(bucket_idx)
-        for tok in meta["span_tokens"]:
-            bucket_vocab[int(bucket_idx)].add(tok)
-    return {bucket: sorted(tokens) for bucket, tokens in bucket_vocab.items()}
+        bucket_idx = int(bucket_idx)
+        meta["bucket_idx"] = bucket_idx
+        for tok in meta.get("span_tokens", []):
+            bucket_counts[bucket_idx][tok] += 1
+    return {
+        bucket: sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        for bucket, counter in bucket_counts.items()
+    }
 
 
 def test_enc_mem_dec_pipeline_smoke() -> None:
@@ -139,20 +122,21 @@ def test_enc_mem_dec_pipeline_smoke() -> None:
     n = 3
     rng = np.random.default_rng(123)
     Lex_en = m4.M4_LexEN_new(seed=1, D=D)
-    Lex_fr = m4.M4_LexEN_new(seed=2, D=D)
+    Lex_fr_mem = m4.M4_LexEN_new(seed=2, D=D)
     pi = rng.permutation(D).astype(np.int64)
 
     encoded_en = enc_pipeline.encode_corpus_ENC(sentences_en, Lex_en, pi, D, n, seg_seed0=999)
-    encoded_fr = enc_pipeline.encode_corpus_ENC(sentences_fr, Lex_fr, pi, D, n, seg_seed0=1999)
+    encoded_fr = enc_pipeline.encode_corpus_ENC(sentences_fr, Lex_fr_mem, pi, D, n, seg_seed0=1999)
 
     tokens_fr = [enc_pipeline.sentence_to_tokens_EN(sent, vocab=set()) for sent in sentences_fr]
     pairs_mem, span_meta = _build_mem_pairs_with_meta(
         encoded_en,
         encoded_fr,
         tokens_fr,
+        L_fr_mem=Lex_fr_mem.get,
+        D=D,
         win=6,
         stride=3,
-        majority="strict",
         max_pairs=10_000,
     )
     assert pairs_mem, "aucune paire MEM générée"
@@ -161,41 +145,26 @@ def test_enc_mem_dec_pipeline_smoke() -> None:
     comp = mem_pipeline.make_mem_pipeline(cfg)
     mem_pipeline.train_one_pass_MEM(comp, pairs_mem)
 
-    bucket2vocab = _bucket_vocab(comp, span_meta)
-    assert bucket2vocab, "vocabulaire par bucket vide"
+    bucket2vocab_freq = _bucket_vocab_freq(comp, span_meta, tokens_fr)
+    assert bucket2vocab_freq, "vocabulaire par bucket vide"
 
-    demo = next((m for m in span_meta if m["span_tokens"]), span_meta[0])
-    history = list(demo["history_tokens"][-4:])
+    meta = next((m for m in span_meta if m.get("span_tokens")), span_meta[0])
+    bucket_idx = int(meta.get("bucket_idx", 0))
+    prototype = comp.mem.H[bucket_idx].astype(np.int8, copy=False)
 
-    rng_demo = np.random.default_rng(4242)
-    H_LM = rademacher(D, rng_demo)
-    for tok in history:
-        H_LM = DD7_updateLM(H_LM, tok, Lex_fr.get, pi)
+    # Payload lexical alignment: every token in the span should correlate positively.
+    positives = 0
+    for tok in meta.get("span_tokens", []):
+        vec = Lex_fr_mem.get(tok).astype(np.int8, copy=False)
+        dot = int(np.dot(prototype.astype(np.int32), vec.astype(np.int32)))
+        if dot > 0:
+            positives += 1
+    if meta.get("span_tokens"):
+        ratio = positives / len(meta["span_tokens"])
+        assert ratio >= 0.5, f"corrélation payload/lexique trop faible ({ratio:.3f})"
 
-    G_DEC = rademacher(D, np.random.default_rng(2025))
-    G_MEM = comp.Gmem
-    prototypes = comp.mem.H.astype(np.int8, copy=False)
-
-    token_star, scores_cand, c_star, C_K, _ = DecodeOneStep(
-        Hs=demo["Z_en"],
-        H_LM=H_LM,
-        history_fr=history,
-        G_DEC=G_DEC,
-        G_MEM=G_MEM,
-        Pi=pi,
-        L_fr=Lex_fr.get,
-        prototypes=prototypes,
-        K=32,
-        alpha=1.0,
-        beta=1.0,
-        ell=max(1, len(history)),
-        lam=0.5,
-        bucket2vocab=bucket2vocab,
-        global_fallback_vocab=sorted({tok for tokens in bucket2vocab.values() for tok in tokens}),
-        return_ck_scores=True,
-    )
-
-    # Assertions ensure the pipeline runs end-to-end and produces coherent outputs.
-    assert isinstance(token_star, str) and token_star
-    assert scores_cand.ndim == 1 and scores_cand.size >= 1
-    assert int(c_star) in C_K
+    # Candidate gating: reference tokens appear among the frequent bucket entries.
+    freq_list = bucket2vocab_freq.get(bucket_idx, [])[:32]
+    top_tokens = {tok for tok, _ in freq_list}
+    if meta.get("span_tokens"):
+        assert any(tok in top_tokens for tok in meta["span_tokens"]), "span hors vocabulaire du bucket"

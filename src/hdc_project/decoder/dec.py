@@ -203,8 +203,8 @@ def DD2_query_bin(
             acc += permute_pow_signed(L_j, Pi, Pi_inv, j).astype(np.int16, copy=False)
         H_hist = sign_int(acc)
 
-    combo = (alpha * Qs.astype(np.int16)) + (beta * H_hist.astype(np.int16))
-    return sign_int(combo.astype(np.int16))
+    combo = (alpha * Qs.astype(np.float32, copy=False)) + (beta * H_hist.astype(np.float32, copy=False))
+    return np.where(combo >= 0.0, 1, -1).astype(np.int8, copy=False)
 
 
 def DD3_bindToMem(Rt: np.ndarray, G_MEM: np.ndarray) -> np.ndarray:
@@ -224,12 +224,23 @@ def DD4_search_topK(Rt_tilde: np.ndarray, prototypes: np.ndarray, K: int) -> Tup
     D = Rt_tilde.shape[0]
     if prototypes.ndim != 2 or prototypes.shape[1] != D or prototypes.dtype != np.int8:
         raise ValueError("prototypes must be an (B, D) int8 matrix")
-    scores = (prototypes.astype(np.int32) @ Rt_tilde.astype(np.int32)).astype(np.int32)
-    K = int(min(K, scores.shape[0]))
-    idx = np.argpartition(scores, -K)[-K:]
-    top_order = idx[np.argsort(scores[idx])[::-1]]
+
+    proto = prototypes.astype(np.int8, copy=False)
+    # Ignore empty prototype rows (never trained buckets) to avoid zero vectors ranking first.
+    valid_idx = np.flatnonzero(np.any(proto != 0, axis=1))
+    if valid_idx.size == 0:
+        raise ValueError("no non-empty prototypes available for search")
+
+    Rt32 = Rt_tilde.astype(np.int32, copy=False)
+    scores_all = (proto.astype(np.int32, copy=False) @ Rt32).astype(np.int32, copy=False)
+
+    K_eff = int(min(max(K, 1), valid_idx.size))
+    scores_valid = scores_all[valid_idx]
+    part = np.argpartition(scores_valid, -K_eff)[-K_eff:]
+    order_local = part[np.argsort(scores_valid[part])[::-1]]
+    top_order = valid_idx[order_local]
     c_star = int(top_order[0])
-    return c_star, top_order.astype(np.int64), scores[top_order]
+    return c_star, top_order.astype(np.int64, copy=False), scores_all[top_order]
 
 
 def DD5_payload(Mc: np.ndarray) -> np.ndarray:
@@ -742,11 +753,12 @@ def DX7_run(
 
 def _as_vocab_from_buckets(
     C_K: np.ndarray,
-    bucket2vocab: Optional[Union[Dict[int, List[str]], Callable[[int], List[str]]]],
+    bucket2vocab: Optional[Union[Dict[int, List[str]], Callable[..., List[str]]]],
     history_fr: Sequence[str],
     global_fallback_vocab: Optional[Sequence[str]],
     *,
     min_size: int = 1,
+    position: Optional[int] = None,
 ) -> List[str]:
     candidates: List[str] = []
     seen: set[str] = set()
@@ -758,13 +770,18 @@ def _as_vocab_from_buckets(
                 candidates.append(tok)
 
     if bucket2vocab is not None:
-        for bucket in C_K:
+        for idx, bucket in enumerate(C_K):
             if callable(bucket2vocab):
-                toks = bucket2vocab(int(bucket))
+                try:
+                    toks = bucket2vocab(int(bucket), position)
+                except TypeError:
+                    toks = bucket2vocab(int(bucket))
             else:
                 toks = bucket2vocab.get(int(bucket), [])
             if toks:
                 add_many(toks)
+            if idx == 0 and len(candidates) >= min_size:
+                break
 
     if len(candidates) < min_size and history_fr:
         add_many(list(history_fr))
@@ -794,6 +811,7 @@ def DecodeOneStep(
     lam: float = 0.5,
     bucket2vocab: Optional[Union[Dict[int, List[str]], Callable[[int], List[str]]]] = None,
     global_fallback_vocab: Optional[Sequence[str]] = None,
+    pos_key_lookup: Optional[Callable[[int], np.ndarray]] = None,
     return_ck_scores: bool = True,
 ) -> Tuple[str, np.ndarray, int, np.ndarray, Union[np.ndarray, np.ndarray]]:
     """Run a single DEC step that wires ``DD1`` through ``DD7``."""
@@ -809,6 +827,13 @@ def DecodeOneStep(
 
     Qs = DD1_ctx(Hs, G_DEC)
     Rt = DD2_query_bin(Qs, history_fr, L_fr, Pi, alpha=alpha, beta=beta, ell=ell)
+    pos_idx = len(history_fr)
+    if pos_key_lookup is not None:
+        pos_vec = pos_key_lookup(pos_idx)
+        if pos_vec is not None:
+            pos_arr = np.asarray(pos_vec, dtype=np.int8, copy=False)
+            hd_assert_pm1(pos_arr, D)
+            Rt = hd_bind(Rt, pos_arr)
     Rt_tilde = DD3_bindToMem(Rt, G_MEM)
     c_star, C_K, scores_CK = DD4_search_topK(Rt_tilde, prototypes, K)
     Z_hat = DD5_payload(prototypes[c_star])
@@ -819,6 +844,7 @@ def DecodeOneStep(
         history_fr=history_fr,
         global_fallback_vocab=global_fallback_vocab,
         min_size=1,
+        position=pos_idx,
     )
 
     token_star, scores_cand, _ = DD6_vote(
@@ -829,6 +855,26 @@ def DecodeOneStep(
         cand_vocab=cand_vocab,
         lam=lam,
     )
+
+    proto_vec_int = prototypes[c_star].astype(np.int32, copy=False)
+    token_vec_int = L_fr(token_star).astype(np.int32, copy=False)
+    if int(proto_vec_int @ token_vec_int) < 0:
+        order = np.argsort(scores_cand)[::-1]
+        replaced = False
+        for idx_alt in order:
+            candidate = cand_vocab[int(idx_alt)]
+            cand_vec_int = L_fr(candidate).astype(np.int32, copy=False)
+            if int(proto_vec_int @ cand_vec_int) >= 0:
+                token_star = candidate
+                replaced = True
+                break
+        if not replaced and global_fallback_vocab is not None:
+            for fallback_tok in global_fallback_vocab:
+                cand_vec_int = L_fr(fallback_tok).astype(np.int32, copy=False)
+                if int(proto_vec_int @ cand_vec_int) >= 0:
+                    token_star = fallback_tok
+                    replaced = True
+                    break
 
     H_LM_next = DD7_updateLM(H_LM, token_star, L_fr, Pi)
 
